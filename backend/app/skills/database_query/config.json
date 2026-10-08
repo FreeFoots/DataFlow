@@ -1,0 +1,14 @@
+{
+  "name": "database_query",
+  "description": "根据字段级Schema图选择MCP工具，生成并执行单数据库只读SQL。",
+  "allowed_tools": [
+    "current_datetime",
+    "resolve_date_range",
+    "query_*"
+  ],
+  "max_tool_calls": 3,
+  "output_actions": [
+    "call_tool",
+    "clarify"
+  ]
+}

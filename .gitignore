@@ -1,0 +1,51 @@
+# Private local configuration, documentation and history
+.env
+.env.*
+*.env
+*.env.*
+docs/
+AGNETS.md
+AGENTS.md
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# All datasets, schemas, embeddings, archives and test artifacts are local
+backend/data/
+backend/evaluation/results/
+
+# Dependencies and generated files
+.git/
+__pycache__/
+*.py[cod]
+*.log
+*.db
+*.db-*
+*.sqlite*
+*.duckdb*
+*.tsbuildinfo
+.DS_Store
+.AppleDouble/
+._*
+.venv/
+.python311/
+.node/
+.downloads/
+node_modules/
+dist/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+
+# Redundant root npm lockfile; the frontend has its own lockfile
+/package-lock.json
+# Detailed internal documentation; runtime skill prompts remain tracked
+backend/evaluation/README.md
+backend/app/mcp_runtime/README.md

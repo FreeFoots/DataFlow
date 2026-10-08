@@ -1,0 +1,7 @@
+{
+  "name": "data_qa",
+  "description": "解释、对比或总结已有查询结果和用户选中的表格。",
+  "allowed_tools": ["build_bar_chart", "build_pie_chart"],
+  "max_tool_calls": 3,
+  "output_actions": ["answer", "report"]
+}
