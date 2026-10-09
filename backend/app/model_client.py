@@ -102,6 +102,15 @@ class ModelClient:
         try:
             payload = json.loads(cleaned)
         except json.JSONDecodeError:
+            completed = ModelClient._complete_outer_containers(cleaned)
+            if completed is not None:
+                try:
+                    payload = json.loads(completed)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    logger.info("model_json_outer_container_completed")
+                    return payload
             match = re.search(r"\{[\s\S]*\}", cleaned)
             if not match:
                 raise RuntimeError("大模型未返回有效 JSON")
@@ -112,6 +121,36 @@ class ModelClient:
         if not isinstance(payload, dict):
             raise RuntimeError("大模型返回的 JSON 必须是对象")
         return payload
+
+    @staticmethod
+    def _complete_outer_containers(raw: str) -> str | None:
+        """Only close outer containers after a complete nested object/array.
+
+        Never infer a value, repair strings/SQL, insert commas or accept token-limit
+        truncation (chat rejects it before parsing). Normal contract checks still run.
+        """
+        if not raw.startswith("{") or not raw.endswith(("}", "]")):
+            return None
+        stack: list[str] = []
+        quoted = escaped = False
+        for char in raw:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if not stack or stack.pop() != ("{" if char == "}" else "["):
+                    return None
+        if quoted or not 1 <= len(stack) <= 2:
+            return None
+        return raw + "".join("}" if char == "{" else "]" for char in reversed(stack))
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -163,6 +202,14 @@ class ModelClient:
     def _post(
         self, url: str, payload: dict[str, Any], *, api_key: str | None = None
     ) -> dict[str, Any]:
+        from .runtime.execution import durable_call
+        return durable_call("model", {"url": url, "payload": payload}, lambda: self._post_uncached(url, payload, api_key=api_key))
+
+    def _post_uncached(
+        self, url: str, payload: dict[str, Any], *, api_key: str | None = None
+    ) -> dict[str, Any]:
+        from .runtime.execution import CURRENT
+        execution = CURRENT.get()
         credential = self.config.api_key if api_key is None else api_key
         if not credential:
             raise RuntimeError("当前模型接口的 API Key 尚未配置")
@@ -179,9 +226,13 @@ class ModelClient:
         )
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries + 1):
+            timeout = self.config.timeout
+            if execution:
+                execution.attempt()
+                timeout = min(timeout, execution.check())
             self.request_attempt_count += 1
             try:
-                with urllib.request.urlopen(request, timeout=self.config.timeout) as response:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
@@ -202,6 +253,8 @@ class ModelClient:
             if attempt < self.config.max_retries:
                 self.retry_count += 1
                 delay = 0.8 * (2**attempt)
+                if execution:
+                    delay = min(delay, execution.check())
                 logger.warning(
                     "model_request_retry endpoint=%s attempt=%s/%s delay_seconds=%.1f error=%s",
                     url,

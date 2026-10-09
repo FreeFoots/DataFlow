@@ -20,7 +20,7 @@ class ResultBuilder:
     ) -> QueryResult:
         return QueryResult(
             task_id=task_id,
-            status="completed",
+            status="partial" if generated.limitations else "completed",
             route="data_qa",
             message="已进入数据问答，没有重复查询数据库。",
             columns=[],
@@ -37,6 +37,10 @@ class ResultBuilder:
             workflow_mode="qa_report" if generated.report else "qa",
             report=generated.report,
             report_tool_calls=generated.tool_calls,
+            result_artifacts=generated.artifacts,
+            analysis_claims=generated.claims,
+            analysis_limitations=generated.limitations,
+            warnings=generated.notes,
         )
 
     @staticmethod
@@ -70,21 +74,25 @@ class ResultBuilder:
             question=str(payload.get("question") or "请补充本次查询所需信息"),
             reason=str(payload.get("reason") or "该信息会改变查询结果"),
             options=payload.get("options") or [],
+            allow_free_text=bool(payload.get("allow_free_text")),
         )
         labels = "、".join(item.label for item in clarification.options)
         return QueryResult(
             task_id=state["task_id"],
             status="waiting_clarification",
-            route="database_query",
-            message="查询已暂停，等待你的补充信息。",
+            route="direct_response" if state.get("workflow_mode") == "request_clarification" else "database_query",
+            message="先确认你想了解什么，再继续分析。" if state.get("workflow_mode") == "request_clarification" else "查询已暂停，等待你的补充信息。",
             clarification=clarification,
-            analysis=f"{clarification.question} 你可以直接回复：{labels}。",
+            analysis=clarification.question + (f" 你可以选择：{labels}。" if labels else "") + (" 也可以用自己的话补充。" if clarification.allow_free_text else ""),
             route_reason=str(state.get("intent", {}).get("reason") or "问数"),
             retrieval=ResultBuilder.public_retrieval(state.get("retrieval") or {}),
             standalone_query=state.get("standalone_query"),
             schema_graph=state.get("schema_graph"),
-            steps=["一次请求预处理：路由并提取检索词", "召回字段并构建Schema图", "LangGraph暂停并等待用户回复"],
+            steps=["理解用户目的", "等待用户确认方向或补充需求"] if state.get("workflow_mode") == "request_clarification" else ["一次请求预处理：路由并提取检索词", "召回字段并构建Schema图", "LangGraph暂停并等待用户回复"],
             workflow_mode=str(state.get("workflow_mode") or "langgraph_hitl"),
+            analysis_plan=(state.get("analysis_state") or {}).get("plan", []),
+            result_artifacts=(state.get("analysis_state") or {}).get("artifacts", []),
+            analysis_budget=(state.get("analysis_state") or {}).get("budget", {}),
         )
 
     @staticmethod
@@ -115,26 +123,33 @@ class ResultBuilder:
         ]
         if state.get("analysis_sources"):
             steps.append(f"综合分析{len(state['analysis_sources'])}张用户指定历史表")
+        asset = (state.get("result_artifacts") or [{}])[0]
+        if asset:
+            steps = ["单库智能体选择受控指标，程序按定义编译查询" if step == "单库智能体选择MCP工具并生成SQL" else step for step in steps]
+            table_labels = [item["label"] for item in SCHEMA if item.get("name") in asset.get("source_tables", [])]
         return QueryResult(
             task_id=state["task_id"],
             status="completed" if final.get("valid", True) else "failed",
             route="database_query",
             message="查询完成" if final.get("valid", True) else "结果校验未通过",
             interpretation=Interpretation(
-                metric="、".join(metric_columns) or "查询结果指标",
-                dimension="、".join(dimension_columns) or "无分组维度",
-                time_range="、".join(
+                metric={"new_users": "新增注册用户", "activation_cohort": "注册队列激活"}.get(asset.get("metric"), "、".join(metric_columns) or "查询结果指标"),
+                dimension="、".join({"channel_id": "渠道", "day": "日期", "month": "月份"}.get(key, key)
+                                   for key in asset["grain"]) or "无分组维度" if asset else "、".join(dimension_columns) or "无分组维度",
+                time_range=asset.get("time_range") or "、".join(
                     (state.get("extraction") or {}).get("time_expressions") or []
                 ) or "未指定",
                 table="、".join(table_labels) or "Schema召回数据表",
-                assumptions=["当前口径由模型识别，尚未通过业务指标编译器验证"],
+                assumptions=list(state["result_artifacts"][0].get("notes", [])) if state.get("result_artifacts")
+                    else ["当前口径由模型识别，尚未通过业务指标编译器验证"],
             ),
             steps=steps,
             sql=combined.sql,
             columns=combined.columns,
             rows=combined.rows,
             truncated=combined.truncated,
-            warnings=["结果超过200行，目前只展示前200行；导出与解读仅覆盖当前预览。"] if combined.truncated else [],
+            warnings=(["结果超过200行，目前只展示前200行；导出与解读仅覆盖当前预览。"] if combined.truncated else [])
+                + (["结果包含数量限制，只覆盖当前所选范围。"] if asset.get("limited") else []),
             analysis=final.get("analysis"),
             route_reason=str(state.get("intent", {}).get("reason") or "问数"),
             retrieval=ResultBuilder.public_retrieval(state.get("retrieval") or {}),
@@ -145,6 +160,8 @@ class ResultBuilder:
             standalone_query=state.get("standalone_query"),
             schema_graph=graph,
             workflow_mode=mode,
+            result_artifacts=state.get("result_artifacts") or [],
+            analysis_claims=final.get("claims") or [],
         )
 
     @staticmethod

@@ -9,6 +9,7 @@ from ..errors import PipelineStageError
 from ..mcp_runtime.client import LocalMcpClient
 from ..model_client import ModelClient
 from ..skills import SkillDefinition
+from .analysis_metrics import QueryMetric
 
 
 class SingleDatabaseAgent:
@@ -45,7 +46,7 @@ class SingleDatabaseAgent:
             tool
             for tool in catalog
             if any(fnmatch(tool["name"], pattern) for pattern in self.skill.allowed_tools)
-            and (not tool["name"].startswith("query_") or tool["name"] == database_tool)
+            and (not tool["name"].startswith("query_") or tool["name"] in {database_tool, "query_metric"})
         ]
         tool_names = {tool["name"] for tool in tools}
         if database_tool not in tool_names:
@@ -108,7 +109,7 @@ class SingleDatabaseAgent:
                 }
                 tool_trace.append(trace)
 
-                if tool_name == database_tool:
+                if tool_name in {database_tool, "query_metric"}:
                     if not bool(tool_result.get("success")) and call_index < self.max_tool_calls:
                         observations.append({
                             "tool": tool_name,
@@ -182,6 +183,14 @@ class SingleDatabaseAgent:
             return f"智能体选择了未提供的MCP工具：{tool_name}"
         if not isinstance(decision.get("arguments"), dict):
             return "MCP工具参数必须是JSON对象"
+        if tool_name == "query_metric":
+            arguments = decision["arguments"]
+            if set(arguments) != {"query"}:
+                return "query_metric参数必须是{query: 指标查询契约}"
+            try:
+                QueryMetric.model_validate(arguments["query"])
+            except (ValueError, TypeError) as exc:
+                return str(exc)
         return ""
 
     @staticmethod
@@ -193,6 +202,8 @@ class SingleDatabaseAgent:
         if decision.get("action") != "call_tool":
             return ""
         if not str(decision.get("tool_name") or "").startswith("query_"):
+            return ""
+        if decision.get("tool_name") == "query_metric":
             return ""
         sql = str((decision.get("arguments") or {}).get("sql") or "")
         if not sql:

@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import replace
+from pathlib import Path
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from ..config import Settings, settings
-from ..database import SCHEMA
+from ..clarification import clarification_answer
+from ..database import SCHEMA, physical_table_name
 from ..errors import PipelineStageError
 from ..mcp_runtime import LocalMcpClient, create_local_mcp_server
 from ..model_client import ModelClient
 from ..models import QueryResult
-from ..preprocessing import RequestPreprocessor
+from ..querying.request_understanding_agent import RequestUnderstandingAgent
 from ..querying.duckdb_engine import DuckDbEngine
 from ..querying.data_qa_agent import DataQaAgent
 from ..querying.models import SqlExecution
+from ..querying.analysis_agent import AnalysisAgent
+from ..querying.analysis_tools import AnalysisTools
 from ..querying.response_generator import ResponseGenerator
 from ..querying.single_database_agent import SingleDatabaseAgent
+from ..querying.result_assets import EvidenceClaim, resolve_fact
+from ..querying.analysis_report import build_analysis_report
 from ..retrieval import SchemaGraphBuilder, SchemaIndex
 from ..security import AccessScope
 from ..skills import SkillRegistry
@@ -33,14 +40,23 @@ class QueryWorkflow:
         model_client: ModelClient,
         schema_index: SchemaIndex,
         config: Settings | None = None,
+        checkpointer=None,
     ) -> None:
         self.model_client = model_client
         self.schema_index = schema_index
         self.config = config or settings
-        self.preprocessor = RequestPreprocessor(model_client)
+        self.request_understanding_agent = RequestUnderstandingAgent(model_client)
+        self.preprocessor = self.request_understanding_agent  # Compatibility for existing callers.
         self.skills = SkillRegistry()
         self.graph_builder = SchemaGraphBuilder()
-        self.database_engine = DuckDbEngine()
+        self.database_engine = DuckDbEngine(Path(self.config.database_root))
+        analysis_skill = self.skills.get("analysis")
+        analysis_tools = AnalysisTools(schema_index, self.database_engine, self.mcp_client,
+                                       exploratory_sql=self.config.analysis_allow_exploratory_sql)
+        analysis_tools.INPUTS = {name: definition for name, definition in analysis_tools.INPUTS.items() if name in analysis_skill.allowed_tools}
+        self.analysis_agent = AnalysisAgent(model_client, analysis_tools,
+            replace(self.config, analysis_max_tool_calls=min(self.config.analysis_max_tool_calls, analysis_skill.max_tool_calls)),
+            analysis_skill.instructions)
         self.single_database_agent = SingleDatabaseAgent(
             model_client,
             self.mcp_client,
@@ -56,7 +72,7 @@ class QueryWorkflow:
             self.mcp_client,
             self.skills.get("data_qa"),
         )
-        self.checkpointer = InMemorySaver()
+        self.checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
         self.graph = self._compile()
 
     def mcp_client(self, access_scope: dict[str, Any]) -> LocalMcpClient:
@@ -65,18 +81,22 @@ class QueryWorkflow:
 
     def _compile(self):
         builder = StateGraph(QueryState)
-        builder.add_node("preprocess", self._preprocess)
-        builder.add_node("respond_directly", self._respond_directly)
-        builder.add_node("answer_qa", self._answer_qa)
-        builder.add_node("retrieve_schema", self._retrieve_schema)
-        builder.add_node("human_clarification", self._human_clarification)
-        builder.add_node("prepare_single_database", self._prepare_single_database)
-        builder.add_node("execute_single_database", self._execute_single_database)
-        builder.add_node("run_multi_database", self._run_multi_database)
+        from ..runtime.execution import CURRENT
+        def node(name, operation):
+            def run(state):
+                execution = CURRENT.get()
+                output = execution.node(name, operation, state) if execution else operation(state)
+                if execution and output.get("analysis_state"):
+                    preview = self.analysis_agent.result(state["task_id"], output["analysis_state"], state.get("intent") or {})
+                    execution.store.progress(state["task_id"], execution.owner, execution.generation, preview.model_dump(mode="json"))
+                return output
+            return run
+        for name in ["preprocess", "request_clarification", "respond_directly", "answer_qa", "retrieve_schema", "human_clarification", "prepare_single_database", "execute_single_database", "run_multi_database", "analysis_initialize", "analysis_decide", "analysis_execute", "analysis_clarification", "analysis_finalize"]:
+            builder.add_node(name, node(name, getattr(self, "_" + name)))
         builder.add_edge(START, "preprocess")
         builder.add_conditional_edges(
             "preprocess",
-            lambda state: {
+            lambda state: "request_clarification" if state.get("clarification") else "analysis_initialize" if state["intent"].get("mode") == "analysis" else {
                 "direct_response": "respond_directly",
                 "data_qa": "answer_qa",
                 "database_query": "retrieve_schema",
@@ -85,10 +105,19 @@ class QueryWorkflow:
                 "respond_directly": "respond_directly",
                 "answer_qa": "answer_qa",
                 "retrieve_schema": "retrieve_schema",
+                "analysis_initialize": "analysis_initialize",
+                "request_clarification": "request_clarification",
             },
         )
+        builder.add_edge("request_clarification", "preprocess")
         builder.add_edge("respond_directly", END)
         builder.add_edge("answer_qa", END)
+        builder.add_edge("analysis_initialize", "analysis_decide")
+        analysis_routes = {"decide": "analysis_decide", "tool": "analysis_execute", "clarify": "analysis_clarification", "final": "analysis_finalize"}
+        builder.add_conditional_edges("analysis_decide", lambda state: state["analysis_route"], analysis_routes)
+        builder.add_conditional_edges("analysis_execute", lambda state: state["analysis_route"], analysis_routes)
+        builder.add_edge("analysis_clarification", "analysis_decide")
+        builder.add_edge("analysis_finalize", END)
         builder.add_conditional_edges(
             "retrieve_schema",
             self._after_retrieval,
@@ -117,33 +146,47 @@ class QueryWorkflow:
 
     @staticmethod
     def run_config(task_id: str) -> dict[str, Any]:
-        return {"configurable": {"thread_id": task_id}}
+        return {"configurable": {"thread_id": task_id}, "recursion_limit": 128}
 
-    def invoke(self, payload: QueryState | Command, task_id: str) -> QueryResult:
-        state = self.graph.invoke(payload, config=self.run_config(task_id))
+    def invoke(self, payload: QueryState | Command | None, task_id: str) -> QueryResult:
+        state = self.graph.invoke(payload, config=self.run_config(task_id), durability="sync")
         return self._state_result(state, task_id)
 
     def _state_result(self, state: dict[str, Any], task_id: str) -> QueryResult:
         if state.get("result"):
-            return QueryResult.model_validate(state["result"])
-        state = {**state, "task_id": state.get("task_id") or task_id}
-        return ResultBuilder.waiting(state)
+            result = QueryResult.model_validate(state["result"])
+        else:
+            state = {**state, "task_id": state.get("task_id") or task_id}
+            result = ResultBuilder.waiting(state)
+        if state.get("request_understanding"):
+            from ..models import RequestUnderstanding
+            result.request_understanding = RequestUnderstanding.model_validate(state["request_understanding"])
+        return result
 
     def _preprocess(self, state: QueryState) -> dict[str, Any]:
         """生成路由、独立查询和 Schema 检索参数。"""
-        decision = self.preprocessor.prepare(state["query"], state.get("route_context", ""))
+        answers = state.get("understanding_answers") or []
+        decision = self.preprocessor.prepare(state["query"], state.get("route_context", ""), answers)
+        requested_mode = state.get("request_mode", "auto")
+        mode = "query"
+        if decision.action == "database_query":
+            mode = decision.mode if requested_mode == "auto" else requested_mode
+        if requested_mode == "analysis" and decision.action != "direct_response" and decision.source != "model_unavailable_fallback":
+            mode = "analysis"
         execution_log = list(state.get("execution_log") or [])
         if decision.source == "model_unavailable_fallback":
             execution_log.append({
                 "stage": "route_fallback",
                 "success": True,
                 "source": decision.source,
+                "mode": mode,
                 "action": decision.action,
                 "reason": decision.reason,
             })
         return {
             "intent": {
                 "action": decision.action,
+                "mode": mode,
                 "confidence": decision.confidence,
                 "reason": decision.reason,
                 "response_type": decision.response_type,
@@ -154,7 +197,48 @@ class QueryWorkflow:
             "rewritten": decision.rewritten,
             "extraction": decision.retrieval.public(),
             "execution_log": execution_log,
+            "request_understanding": {**decision.understanding.model_dump(mode="json"), "clarifications": answers},
+            "clarification": decision.clarification,
+            "workflow_mode": "request_clarification" if decision.clarification else "",
+            "result": {},
         }
+
+    def _request_clarification(self, state: QueryState) -> dict[str, Any]:
+        question = state["clarification"]
+        response = interrupt(question)
+        response = response if isinstance(response, dict) else {"option_id": str(response)}
+        answer = clarification_answer(question, response.get("option_id", ""), response.get("answer"))
+        return {"understanding_answers": [*(state.get("understanding_answers") or []), answer],
+                "clarification": None, "result": {}}
+
+    def _analysis_initialize(self, state: QueryState) -> dict[str, Any]:
+        analysis = self.analysis_agent.initialize(state.get("standalone_query") or state["query"], state["query"])
+        return {"analysis_state": analysis, "workflow_mode": "analysis_agent", "clarification": None}
+
+    def _analysis_decide(self, state: QueryState) -> dict[str, Any]:
+        analysis = self.analysis_agent.decide(state["task_id"], state["analysis_state"], state.get("access_scope") or {}, state.get("workspace") or {})
+        return {"analysis_state": analysis, "analysis_route": analysis["next"], "clarification": analysis.get("clarification") if analysis["next"] == "clarify" else None}
+
+    def _analysis_execute(self, state: QueryState) -> dict[str, Any]:
+        analysis = self.analysis_agent.execute(state["task_id"], state["analysis_state"], state.get("access_scope") or {})
+        return {"analysis_state": analysis, "analysis_route": analysis["next"]}
+
+    def _analysis_clarification(self, state: QueryState) -> dict[str, Any]:
+        response = interrupt(state["clarification"])
+        option_id = str(response.get("option_id") if isinstance(response, dict) else response)
+        analysis = dict(state["analysis_state"])
+        question = analysis["clarification"]
+        option = next((o for o in question["options"] if o["id"] == option_id), None)
+        if option is None:
+            raise PipelineStageError("analysis_clarification", "无效的澄清选项")
+        analysis["clarification_answers"] = {**analysis["clarification_answers"], question["parameter"]: option}
+        analysis.pop("clarification", None)
+        analysis["next"] = "decide"
+        return {"analysis_state": analysis, "clarification": None}
+
+    def _analysis_finalize(self, state: QueryState) -> dict[str, Any]:
+        result = self.analysis_agent.result(state["task_id"], state["analysis_state"], state.get("intent") or {})
+        return {"result": result.model_dump(mode="json")}
 
     def _respond_directly(self, state: QueryState) -> dict[str, Any]:
         """返回预处理模型生成的普通回答或自然语言澄清。"""
@@ -170,14 +254,30 @@ class QueryWorkflow:
         }
 
     def _answer_qa(self, state: QueryState) -> dict[str, Any]:
+        # Read authorization from the task, never from a model or client table.
+        scope = AccessScope.from_dict(state.get("access_scope") or {})
+        allowed = {physical_table_name(table) for table in SCHEMA if scope.allows_table(table.get("database", "short_video_ops"), table["id"])}
+        artifacts = state.get("qa_artifacts") or []
+        trusted = {}
+        for artifact in artifacts:
+            tables = set(artifact.get("source_tables") or [])
+            if tables and tables.issubset(allowed):
+                trusted[artifact["result_id"]] = artifact
+        # Derived assets inherit access only if all of their parents are authorized.
+        for _ in artifacts:
+            for artifact in artifacts:
+                parents = artifact.get("derived_from") or []
+                if parents and set(parents).issubset(trusted):
+                    trusted[artifact["result_id"]] = artifact
         qa_result = self.data_qa_agent.run(
-            state["query"],
+            (state.get("request_understanding") or {}).get("standard_request") or state["query"],
             {
                 "short_term": state.get("short_term_context", ""),
                 "recent_result": state.get("recent_result_context", ""),
                 "selected_tables": state.get("analysis_context", ""),
             },
             state.get("access_scope") or {},
+            artifacts=list(trusted.values()),
         )
         result = ResultBuilder.qa(
             state["task_id"], qa_result, state["intent"], state.get("analysis_sources") or []
@@ -277,6 +377,8 @@ class QueryWorkflow:
             "mcp_tool_trace": decision.get("tool_trace", []),
             "direct_sql": str(execution.get("sql") or ""),
             "sql_source": decision.get("source", "model"),
+            "result_artifacts": [{**execution["artifact"], "result_id": f"{state['task_id']}:r1"}]
+                if execution.get("artifact") else [],
         }
 
     def _execute_single_database(self, state: QueryState) -> dict[str, Any]:
@@ -289,6 +391,7 @@ class QueryWorkflow:
             rows=list(raw_execution.get("rows") or []),
             error=raw_execution.get("error"),
             truncated=bool(raw_execution.get("truncated", False)),
+            limited=bool(raw_execution.get("limited", False)),
         )
         trace = list(state.get("mcp_tool_trace") or [])
         log = [
@@ -306,7 +409,7 @@ class QueryWorkflow:
             "via": "mcp",
         })
         database_call = next(
-            (item for item in reversed(trace) if item.get("tool") == f"query_{database}"),
+            (item for item in reversed(trace) if item.get("tool") in {f"query_{database}", "query_metric"}),
             {},
         )
         call = {
@@ -328,7 +431,8 @@ class QueryWorkflow:
             result = ResultBuilder.failed(state, execution, log)
             return {"execution_log": log, "tool_calls": [call], "result": result.model_dump(mode="json")}
         try:
-            final = self.response_generator.finalize(
+            artifacts = state.get("result_artifacts") or []
+            final = self._metric_description(artifacts) if artifacts else self.response_generator.finalize(
                 state["standalone_query"], execution, state["schema_context"],
                 state.get("analysis_context", ""),
             )
@@ -343,6 +447,20 @@ class QueryWorkflow:
             }
         result = ResultBuilder.completed(state, [execution], execution, final, [call], log)
         return {"execution_log": log, "tool_calls": [call], "result": result.model_dump(mode="json")}
+
+    @staticmethod
+    def _metric_description(artifacts: list[dict]) -> dict:
+        source = artifacts[0]
+        if not source.get("complete") or source.get("limited"):
+            return {"valid": True, "title": source["title"],
+                    "analysis": "查询结果已返回；当前展示为限定范围数据，不能据此计算整体统计。"}
+        source_id = source["result_id"]
+        facts = [{"source_id": source_id, "section": "summary", "field": key}
+                 for key in source.get("summary", {})]
+        claim = EvidenceClaim(text="查询事实", evidence_ids=[source_id], facts=facts)
+        checked = [{**claim.model_dump(), "facts": [resolve_fact(fact, {source_id: source}) for fact in claim.facts]}]
+        report = build_analysis_report(source["title"], checked, artifacts)
+        return {"valid": True, "title": source["title"], "analysis": report.markdown, "claims": checked}
 
     def _run_multi_database(self, state: QueryState) -> dict[str, Any]:
         """返回尚未实现的多数据库查询结果。"""

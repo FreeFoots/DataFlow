@@ -19,7 +19,9 @@ const displayMarkdown = computed(() => {
       lines.splice(firstContent, 1)
     }
   }
-  return lines.join("\n").trim()
+  const markdown = lines.join("\n").trim()
+  const summary = props.report.summary?.trim()
+  return summary && markdown.startsWith(summary) ? markdown.slice(summary.length).trim() : markdown
 })
 
 function exportMarkdown() {
@@ -68,12 +70,15 @@ function exportPdf() {
 <template>
   <article ref="reportElement" class="report-card">
     <header class="report-header">
-      <div><small>MARKDOWN REPORT</small><h2>{{ report.title }}</h2></div>
+      <div><small>分析报告</small><h2>{{ report.title }}</h2></div>
       <div class="report-actions">
         <button @click="exportMarkdown"><span>↓</span> 导出 .md</button>
         <button class="pdf-export" title="打开系统打印窗口并保存为PDF" @click="exportPdf"><span>▣</span> 导出 PDF</button>
       </div>
     </header>
+    <div v-if="report.summary" class="report-takeaway">
+      <small>核心结论</small><MarkdownReport :markdown="report.summary" />
+    </div>
     <div v-if="report.visualizations.length" class="report-charts">
       <AnalysisChart v-for="(spec, index) in report.visualizations" :key="`${spec.source_task_id}:${index}`" :spec="spec" :sources="sources" />
     </div>

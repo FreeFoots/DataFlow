@@ -31,10 +31,12 @@ class QueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     session_id: str = "demo-session"
     workspace: WorkspaceConfig | None = None
+    mode: Literal["auto", "query", "analysis"] = "auto"
 
 
 class ClarificationRequest(BaseModel):
-    option_id: str
+    option_id: str = ""
+    answer: str | None = Field(default=None, max_length=500)
 
 
 class ClarificationOption(BaseModel):
@@ -49,6 +51,14 @@ class Clarification(BaseModel):
     question: str
     reason: str
     options: list[ClarificationOption]
+    allow_free_text: bool = False
+
+
+class RequestUnderstanding(BaseModel):
+    summary: str = ""
+    standard_request: str = ""
+    status: Literal["ready", "needs_clarification"] = "ready"
+    clarifications: list[dict[str, str]] = Field(default_factory=list)
 
 
 class Interpretation(BaseModel):
@@ -65,18 +75,21 @@ class VisualizationSpec(BaseModel):
     source_task_id: str
     category_field: str
     value_field: str
+    category_labels: dict[str, str] = Field(default_factory=dict)
+    value_label: str = ""
     max_items: int = Field(default=12, ge=3, le=30)
 
 
 class AnalysisReport(BaseModel):
     title: str
     markdown: str
+    summary: str = ""
     visualizations: list[VisualizationSpec] = Field(default_factory=list)
 
 
 class QueryResult(BaseModel):
     task_id: str
-    status: Literal["waiting_clarification", "completed", "failed"]
+    status: Literal["waiting_clarification", "completed", "partial", "failed"]
     route: Literal["database_query", "data_qa", "direct_response"]
     message: str
     interpretation: Interpretation | None = None
@@ -96,10 +109,18 @@ class QueryResult(BaseModel):
     result_title: str | None = None
     analysis_sources: list[dict[str, Any]] = Field(default_factory=list)
     standalone_query: str | None = None
+    request_understanding: RequestUnderstanding | None = None
     schema_graph: dict[str, Any] | None = None
     workflow_mode: str | None = None
     report: AnalysisReport | None = None
     report_tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    analysis_plan: list[dict[str, Any]] = Field(default_factory=list)
+    result_artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    analysis_claims: list[dict[str, Any]] = Field(default_factory=list)
+    analysis_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+    analysis_limitations: list[str] = Field(default_factory=list)
+    stop_reason: str | None = None
+    analysis_budget: dict[str, Any] = Field(default_factory=dict)
 
 
 class SchemaField(BaseModel):

@@ -13,3 +13,4 @@ class SqlExecution:
     error: str | None = None
     execution_ms: float = 0.0
     truncated: bool = False
+    limited: bool = False

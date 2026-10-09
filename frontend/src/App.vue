@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from "vue"
-import { api } from "./api"
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue"
+import { api, ApiError } from "./api"
 import ReportCard from "./components/ReportCard.vue"
 import ResultTableCard from "./components/ResultTableCard.vue"
-import type { AuthUser, QueryResult, ReportDataSource, SavedMemory, SchemaField, SchemaTable, WorkspaceConfig } from "./types"
+import type { AuthUser, DurableTask, QueryMode, QueryResult, ReportDataSource, SavedMemory, SchemaField, SchemaTable, WorkspaceConfig } from "./types"
 
 interface ConversationTurn {
   query: string
@@ -30,6 +30,7 @@ interface HistoricalResultTable {
 const SAVED_TABLE_LIMIT = 8
 const FIELD_LIBRARY_LIMIT = 12
 const input = ref("")
+const queryMode = ref<QueryMode>("auto")
 const loading = ref(false)
 const pendingQuery = ref("")
 const error = ref("")
@@ -47,6 +48,114 @@ const authReady = ref(false)
 const loginLoading = ref(false)
 const loginUsername = ref("admin")
 const loginPassword = ref("admin123")
+const durableTasks = ref<DurableTask[]>([])
+const pendingTask = ref<DurableTask | null>(null)
+const resumingTaskId = ref("")
+const waitingTask = computed(() => durableTasks.value.find((task) => task.session_id === activeConversationId.value && task.state === "waiting_clarification"))
+const inputPlaceholder = computed(() => waitingTask.value?.result?.clarification?.allow_free_text ? "用自己的话补充目的、范围或时间…" : "向数据提问…")
+const progressText = computed(() => {
+  const task = pendingTask.value
+  if (!task) return "正在保存任务…"
+  if (task.state === "queued") return "任务已保存，正在等待处理"
+  if (task.state === "cancel_requested") return "正在停止处理…"
+  if (task.analysis_progress) {
+    const steps = task.analysis_progress.plan
+    const current = steps.find(step => step.status === "pending")
+    return `${current?.title || '正在整理分析'} · 已完成 ${steps.filter(step => step.status === 'completed').length}/${steps.length} 步 · 已取得 ${task.analysis_progress.result_count} 份数据依据`
+  }
+  const stages: Record<string, string> = { starting: "正在准备分析", preprocess: "正在理解问题", retrieve_schema: "正在查找相关数据", prepare_single_database: "正在查询数据", execute_single_database: "正在整理结果", answer_qa: "正在分析已有结果", respond_directly: "正在整理回答" }
+  return stages[task.stage] || "正在分析，刷新页面也可继续查看"
+})
+let pollingTimer: ReturnType<typeof window.setInterval> | undefined
+let polling = false
+let workspaceEpoch = 0
+
+onUnmounted(() => {
+  workspaceEpoch++
+  if (pollingTimer) window.clearInterval(pollingTimer)
+})
+
+function applyTask(task: DurableTask) {
+  const index = durableTasks.value.findIndex((item) => item.task_id === task.task_id)
+  if (index >= 0) durableTasks.value[index] = task
+  else durableTasks.value.push(task)
+  let conversation = conversations.value.find((item) => item.id === task.session_id)
+  if (!conversation) {
+    conversation = { id: task.session_id, title: task.query.slice(0, 18), updatedAt: task.updated_at * 1000, workspace: normalizeWorkspace(task.workspace), turns: [] }
+    conversations.value.push(conversation)
+  }
+  conversation.updatedAt = task.updated_at * 1000
+  if (task.result) {
+    const turn = conversation.turns.find((item) => item.result.task_id === task.task_id)
+    if (turn) turn.result = task.result
+    else conversation.turns.push({ query: task.query, result: task.result })
+  } else if (["cancelled", "timed_out"].includes(task.state)) {
+    const result: QueryResult = { task_id: task.task_id, status: "failed", route: "database_query", message: task.state === "cancelled" ? "任务已取消" : "任务执行超时", analysis: task.state === "cancelled" ? "任务已取消" : "请缩小查询范围后重试", interpretation: null, clarification: null, steps: [], sql: null, columns: [], rows: [], saved: false }
+    if (!conversation.turns.some((turn) => turn.result.task_id === task.task_id)) conversation.turns.push({ query: task.query, result })
+  }
+  const active = durableTasks.value.find((item) => item.session_id === activeConversationId.value && ["queued", "running", "cancel_requested"].includes(item.state))
+  pendingTask.value = active || null
+  loading.value = Boolean(active)
+  pendingQuery.value = active?.query || ""
+  tidyConversations()
+}
+
+async function pollTasks() {
+  if (polling || !authUser.value) return
+  polling = true
+  const epoch = workspaceEpoch
+  try {
+    const storageKey = `dataflow_pending_submission:${authUser.value.user_id}`
+    const pending = sessionStorage.getItem(storageKey)
+    if (pending) {
+      const request = JSON.parse(pending) as { query: string; workspace: WorkspaceConfig; sessionId: string; key: string; mode?: QueryMode }
+      const accepted = await api.submitTask(request.query, request.workspace, request.sessionId, request.key, request.mode ?? "auto")
+      if (epoch !== workspaceEpoch) return
+      sessionStorage.removeItem(storageKey)
+      applyTask(accepted)
+    }
+    for (const task of durableTasks.value.filter((item) => ["queued", "running", "cancel_requested"].includes(item.state))) {
+      const updated = await api.task(task.task_id)
+      if (epoch !== workspaceEpoch) return
+      applyTask(updated)
+    }
+    if (error.value.startsWith("连接暂时中断")) error.value = ""
+  } catch (caught) {
+    if (caught instanceof ApiError && caught.status >= 400 && caught.status < 500) sessionStorage.removeItem(`dataflow_pending_submission:${authUser.value?.user_id}`)
+    if (epoch === workspaceEpoch && pendingTask.value) error.value = "连接暂时中断，任务已保存；恢复连接后会继续显示进度"
+  } finally {
+    polling = false
+  }
+}
+
+async function cancelPendingTask() {
+  if (!pendingTask.value) return
+  try { applyTask(await api.cancelTask(pendingTask.value.task_id)) }
+  catch (caught) { error.value = caught instanceof Error ? caught.message : "取消失败" }
+}
+
+async function resumeTask(taskId: string, optionId: string, answer?: string) {
+  const task = durableTasks.value.find((item) => item.task_id === taskId)
+  if (!task || loading.value || resumingTaskId.value) return false
+  const storageKey = `dataflow_pending_resume:${authUser.value?.user_id}:${taskId}`
+  error.value = ""
+  resumingTaskId.value = taskId
+  try {
+    const saved = sessionStorage.getItem(storageKey)
+    const previous = saved ? JSON.parse(saved) as { optionId: string; answer?: string; version: number; key: string } : null
+    const pending = previous && previous.version === task.version ? previous : null
+    if (pending && (pending.optionId !== optionId || pending.answer !== answer)) throw new Error("上一次补充尚未确认，请先重试相同内容或刷新页面")
+    const response = pending || { optionId, answer, version: task.version, key: crypto.randomUUID() }
+    sessionStorage.setItem(storageKey, JSON.stringify(response))
+    applyTask(await api.resumeTask(taskId, response.optionId, response.version, response.key, response.answer))
+    sessionStorage.removeItem(storageKey)
+    return true
+  } catch (caught) {
+    if (caught instanceof ApiError && caught.status >= 400 && caught.status < 500) sessionStorage.removeItem(storageKey)
+    error.value = caught instanceof Error ? caught.message : "补充信息提交失败"
+    return false
+  } finally { resumingTaskId.value = "" }
+}
 const prompts = computed(() => {
   const role = authUser.value?.role
   if (role === "growth_ops") return ["查询2026年每个月的新增用户数", "查询2026年4月各渠道的注册用户数", "查询自然推荐渠道激活用户的平均激活耗时"]
@@ -77,6 +186,9 @@ const reportDataSources = computed<ReportDataSource[]>(() => {
   const sources = new Map<string, ReportDataSource>()
   for (const conversation of conversations.value) {
     for (const turn of conversation.turns) {
+      for (const artifact of turn.result.result_artifacts ?? []) {
+        sources.set(artifact.result_id, { taskId: artifact.result_id, title: artifact.title, columns: artifact.columns, rows: artifact.rows })
+      }
       if (!turn.result.rows.length) continue
       sources.set(turn.result.task_id, {
         taskId: turn.result.task_id,
@@ -188,18 +300,39 @@ onMounted(async () => {
 })
 
 async function initializeUserWorkspace() {
+  workspaceEpoch++
+  if (pollingTimer) window.clearInterval(pollingTimer)
+  durableTasks.value = []
+  pendingTask.value = null
+  loading.value = false
   conversations.value = []
   activeConversationId.value = ""
   workspace.value = {}
   schema.value = []
   savedMemories.value = []
-  createConversation()
   try {
-    const [schemaResult, memories] = await Promise.all([api.schema(), api.memories()])
+    const [schemaResult, memories, tasks] = await Promise.all([api.schema(), api.memories(), api.tasks()])
     schema.value = schemaResult
     savedMemories.value = memories
+    for (const task of tasks) applyTask(task)
+    if (conversations.value[0]) selectConversation(conversations.value[0].id)
+    else createConversation()
+    // Keep the exact submission key after an ambiguous network response, including reload.
+    const key = `dataflow_pending_submission:${authUser.value?.user_id}`
+    const persisted = sessionStorage.getItem(key)
+    if (persisted) {
+      const request = JSON.parse(persisted) as { query: string; workspace: WorkspaceConfig; sessionId: string; key: string; mode?: QueryMode }
+      const task = await api.submitTask(request.query, request.workspace, request.sessionId, request.key, request.mode ?? "auto")
+      applyTask(task)
+      selectConversation(task.session_id)
+      sessionStorage.removeItem(key)
+    }
   } catch (caught) {
+    if (caught instanceof ApiError && caught.status >= 400 && caught.status < 500) sessionStorage.removeItem(`dataflow_pending_submission:${authUser.value?.user_id}`)
     error.value = caught instanceof Error ? caught.message : "工作区加载失败"
+  } finally {
+    if (!activeConversation.value) createConversation()
+    pollingTimer = window.setInterval(pollTasks, 1000)
   }
 }
 
@@ -228,6 +361,8 @@ async function logoutUser() {
   try {
     await api.logout()
   } finally {
+    workspaceEpoch++
+    if (pollingTimer) window.clearInterval(pollingTimer)
     authUser.value = null
     conversations.value = []
     activeConversationId.value = ""
@@ -287,10 +422,16 @@ function selectConversation(id: string) {
   input.value = ""
   error.value = ""
   leftOpen.value = false
+  pendingTask.value = durableTasks.value.find((task) => task.session_id === id && ["queued", "running", "cancel_requested"].includes(task.state)) || null
+  loading.value = Boolean(pendingTask.value)
+  pendingQuery.value = pendingTask.value?.query || ""
   nextTick(() => conversationScroll.value?.scrollTo({ top: conversationScroll.value.scrollHeight }))
 }
 
-function removeConversation(id: string) {
+async function removeConversation(id: string) {
+  try { await api.hideSession(id) }
+  catch (caught) { error.value = caught instanceof Error ? caught.message : "无法移除对话"; return }
+  durableTasks.value = durableTasks.value.filter((task) => task.session_id !== id)
   conversations.value = conversations.value.filter((item) => item.id !== id)
   if (activeConversationId.value === id) {
     if (conversations.value[0]) selectConversation(conversations.value[0].id)
@@ -312,8 +453,17 @@ function saveActiveConversation() {
 
 async function submit(text?: string) {
   const query = (text ?? input.value).trim()
-  if (!query || loading.value) return
+  if (!query || loading.value || resumingTaskId.value) return
   if (!activeConversation.value) createConversation()
+  const waiting = durableTasks.value.find((task) => task.session_id === activeConversationId.value && task.state === "waiting_clarification")
+  if (waiting) {
+    const options = waiting.result?.clarification?.options || []
+    const matches = options.filter((option) => option.id === query || option.label === query)
+    if (matches.length === 1) { if (await resumeTask(waiting.task_id, matches[0]!.id)) input.value = "" }
+    else if (waiting.result?.clarification?.allow_free_text) { if (await resumeTask(waiting.task_id, "", query)) input.value = "" }
+    else error.value = "请先选择补充信息选项，或取消这个任务"
+    return
+  }
   loading.value = true
   pendingQuery.value = query
   error.value = ""
@@ -329,19 +479,22 @@ async function submit(text?: string) {
         rows: table.rows.slice(0, 50),
       })),
     }
-    const result = await api.query(
-      query,
-      requestWorkspace,
-      activeConversation.value?.id ?? "studio-demo",
-    )
-    activeConversation.value?.turns.push({ query, result })
-    saveActiveConversation()
+    const storageKey = `dataflow_pending_submission:${authUser.value?.user_id}`
+    const existing = sessionStorage.getItem(storageKey)
+    const previous = existing ? JSON.parse(existing) as { query: string; workspace: WorkspaceConfig; sessionId: string; key: string; mode?: QueryMode } : null
+    if (previous && (previous.query !== query || previous.sessionId !== activeConversationId.value)) throw new Error("上一条提交尚未确认，请先重新连接或刷新页面")
+    const request = previous || { query, workspace: requestWorkspace, sessionId: activeConversationId.value, key: crypto.randomUUID(), mode: queryMode.value }
+    sessionStorage.setItem(storageKey, JSON.stringify(request))
+    const task = await api.submitTask(request.query, request.workspace, request.sessionId, request.key, request.mode ?? "auto")
+    sessionStorage.removeItem(storageKey)
+    applyTask(task)
   } catch (caught) {
+    if (caught instanceof ApiError && caught.status >= 400 && caught.status < 500) sessionStorage.removeItem(`dataflow_pending_submission:${authUser.value?.user_id}`)
     error.value = caught instanceof Error ? caught.message : "查询失败"
     input.value = query
   } finally {
-    loading.value = false
-    pendingQuery.value = ""
+    loading.value = Boolean(pendingTask.value)
+    pendingQuery.value = pendingTask.value?.query || ""
   }
 }
 
@@ -587,17 +740,34 @@ function clarificationHint(result: QueryResult) {
               <div class="message-avatar assistant">D</div>
               <div class="message-body assistant-body">
                 <div class="answer-heading" :class="{ 'qa-heading': turn.result.route !== 'database_query' }">
-                  <div><small>DataFlow</small><strong v-if="turn.result.route === 'database_query'">{{ turn.result.status === "failed" ? "处理失败" : turn.result.status === "waiting_clarification" ? "需要补充信息" : "查询完成" }}</strong></div>
+                  <div><small>DataFlow</small><strong v-if="turn.result.route === 'database_query' || turn.result.status === 'waiting_clarification'">{{ turn.result.status === "failed" ? (turn.result.message === "任务已取消" ? "任务已取消" : (turn.result.message || "").includes("超时") ? "任务已超时" : "暂时未能完成") : turn.result.status === "waiting_clarification" ? (turn.result.workflow_mode === "request_clarification" ? "确认你的分析目的" : "需要补充信息") : turn.result.status === "partial" ? "部分完成" : turn.result.workflow_mode === "analysis_agent" ? "分析完成" : "查询完成" }}</strong></div>
                   <span v-if="turn.result.route === 'database_query' && turn.result.status === 'completed'">
-                    {{ turn.result.workflow_mode === "single_database_agent" ? "单库智能体" : "多库流程" }}
+                    {{ turn.result.workflow_mode === "analysis_agent" ? "深入分析" : turn.result.workflow_mode === "single_database_agent" ? "单库智能体" : "多库流程" }}
                   </span>
                 </div>
 
                 <div v-if="turn.result.status === 'waiting_clarification'" class="natural-clarification">
+                  <p v-if="turn.result.request_understanding?.summary" class="understanding-summary">{{ turn.result.request_understanding.summary }}</p>
                   <p>{{ turn.result.clarification?.question }}</p>
                   <small>{{ turn.result.clarification?.reason }}</small>
-                  <span v-if="clarificationHint(turn.result)">请直接回复：{{ clarificationHint(turn.result) }}</span>
+                  <p v-if="turn.result.request_understanding?.standard_request" class="request-draft"><small>建议这样描述需求</small>{{ turn.result.request_understanding.standard_request }}</p>
+                  <span v-if="turn.result.clarification?.allow_free_text">选择一个方向，或在下方用自己的话补充。</span>
+                  <span v-else-if="clarificationHint(turn.result)">请直接回复：{{ clarificationHint(turn.result) }}</span>
+                  <div class="task-actions" v-if="durableTasks.find(task => task.task_id === turn.result.task_id)?.state === 'waiting_clarification'">
+                    <div class="clarification-options">
+                      <button v-for="option in turn.result.clarification?.options" :key="option.id" :disabled="loading || Boolean(resumingTaskId)" @click="resumeTask(turn.result.task_id, option.id)">
+                        <strong>{{ option.label }}<em v-if="option.recommended">建议</em></strong><small>{{ option.description }}</small>
+                      </button>
+                    </div>
+                    <button @click="api.cancelTask(turn.result.task_id).then(applyTask)">取消任务</button>
+                  </div>
                 </div>
+
+                <details v-if="turn.result.request_understanding?.standard_request && turn.result.request_understanding.status === 'ready' && (turn.result.request_understanding.standard_request !== turn.query || turn.result.request_understanding.clarifications.length)" class="request-understanding">
+                  <summary>本次理解的需求</summary>
+                  <p>{{ turn.result.request_understanding.standard_request }}</p>
+                  <div v-for="(answer, index) in turn.result.request_understanding.clarifications" :key="index"><small>{{ answer.question }}</small><p>你的补充：{{ answer.answer }}</p></div>
+                </details>
 
                 <details v-if="turn.result.retrieval && turn.result.status !== 'waiting_clarification'" class="execution-details">
                   <summary>查看检索过程</summary>
@@ -610,14 +780,14 @@ function clarificationHint(result: QueryResult) {
                 </details>
 
                 <div
-                  v-if="turn.result.standalone_query && turn.result.standalone_query !== turn.query"
+                  v-if="!turn.result.request_understanding && turn.result.workflow_mode !== 'analysis_agent' && turn.result.standalone_query && turn.result.standalone_query !== turn.query"
                   class="standalone-query"
                 >
                   <small>本轮独立查询</small>
                   <span>{{ turn.result.standalone_query }}</span>
                 </div>
 
-                <div v-if="turn.result.analysis_sources?.length" class="analysis-source-strip">
+                <div v-if="turn.result.workflow_mode !== 'analysis_agent' && turn.result.analysis_sources?.length" class="analysis-source-strip">
                   <strong>综合分析来源</strong>
                   <span v-for="source in turn.result.analysis_sources" :key="source.task_id">
                     ▦ {{ source.title }} · {{ source.row_count }} 行
@@ -640,7 +810,22 @@ function clarificationHint(result: QueryResult) {
                   :sources="reportDataSources"
                 />
 
-                <p v-else-if="turn.result.route !== 'database_query' && turn.result.analysis" class="qa-answer">{{ turn.result.analysis }}</p>
+                <p v-else-if="turn.result.route !== 'database_query' && turn.result.analysis && turn.result.status !== 'waiting_clarification'" class="qa-answer">{{ turn.result.analysis }}</p>
+
+                <details v-if="turn.result.analysis_plan?.length" class="execution-details analysis-progress">
+                  <summary>查看分析步骤与数据依据</summary>
+                  <ol><li v-for="step in turn.result.analysis_plan" :key="step.id">{{ step.status === 'completed' ? '✓' : '待完成' }} {{ step.title }}</li></ol>
+                  <details v-for="artifact in turn.result.result_artifacts" :key="artifact.result_id" class="analysis-evidence">
+                    <summary>{{ artifact.title }} · {{ artifact.rows.length }} 行{{ artifact.truncated ? '（预览）' : artifact.limited ? '（限定范围）' : '' }}</summary>
+                    <small>依据编号：{{ artifact.result_id }} · {{ artifact.semantic_verified ? '按演示指标定义计算' : '探索性结果' }}</small>
+                    <p v-for="note in artifact.notes" :key="note">{{ note }}</p>
+                    <ResultTableCard :title="artifact.title" :columns="artifact.columns" :rows="artifact.rows" :truncated="artifact.truncated" />
+                    <details v-if="artifact.sql"><summary>查询详情</summary><pre><code>{{ artifact.sql }}</code></pre></details>
+                  </details>
+                </details>
+                <div v-if="turn.result.analysis_hypotheses?.length" class="scope-card">
+                  <strong>待验证解释</strong><p v-for="hypothesis in turn.result.analysis_hypotheses" :key="hypothesis.statement">{{ hypothesis.statement }}</p>
+                </div>
 
                 <ResultTableCard
                   v-if="turn.result.route === 'database_query' && turn.result.status === 'completed' && turn.result.rows.length"
@@ -659,11 +844,12 @@ function clarificationHint(result: QueryResult) {
                 </ResultTableCard>
 
                 <div
-                  v-if="turn.result.route === 'database_query' && turn.result.analysis && turn.result.status !== 'waiting_clarification'"
+                  v-if="turn.result.route === 'database_query' && !turn.result.report && turn.result.analysis && turn.result.status !== 'waiting_clarification'"
                   class="result-analysis"
                 >
-                  <strong>结果说明</strong>
+                  <strong>{{ turn.result.status === 'failed' ? '本次处理情况' : '结果说明' }}</strong>
                   <p>{{ turn.result.analysis }}</p>
+                  <button v-if="turn.result.status === 'failed' && turn.result.request_understanding?.status === 'ready' && turn.result.request_understanding.standard_request" class="retry-confirmed-request" :disabled="loading || Boolean(waitingTask) || Boolean(resumingTaskId)" @click="submit(turn.result.request_understanding.standard_request)">按已确认的需求重试</button>
                 </div>
               </div>
             </div>
@@ -676,7 +862,7 @@ function clarificationHint(result: QueryResult) {
 
           <div v-if="loading" class="assistant-message loading-message">
             <div class="message-avatar assistant">D</div>
-            <div class="loading-copy"><span></span><div><strong>正在分析</strong><small>理解问题并检索相关 Schema…</small></div></div>
+            <div class="loading-copy"><span></span><div><strong>正在分析</strong><small>{{ progressText }}</small><button v-if="pendingTask && pendingTask.state !== 'cancel_requested'" @click="cancelPendingTask">取消任务</button></div></div>
           </div>
         </div>
         </div>
@@ -687,10 +873,13 @@ function clarificationHint(result: QueryResult) {
 
       <footer class="composer">
         <div class="composer-box">
-          <textarea v-model="input" rows="1" placeholder="向数据提问…" @keydown.enter.exact.prevent="submit()"></textarea>
+          <textarea v-model="input" rows="1" :placeholder="inputPlaceholder" aria-label="输入问题或补充需求" maxlength="500" @keydown.enter.exact.prevent="submit()"></textarea>
           <div class="composer-meta">
+            <select v-model="queryMode" aria-label="分析方式" :disabled="loading">
+              <option value="auto">自动选择</option><option value="query">直接问数</option><option value="analysis">深入分析</option>
+            </select>
             <span>问数 {{ confirmedFields.length }} 个字段 · 分析 {{ selectedAnalysisTables.length }} 张结果表</span>
-            <button :disabled="!input.trim() || loading" @click="submit()">↑</button>
+            <button :disabled="!input.trim() || loading || Boolean(resumingTaskId)" @click="submit()">↑</button>
           </div>
         </div>
         <small>模型可能产生偏差，缺少关键业务口径时会在对话中继续询问。</small>

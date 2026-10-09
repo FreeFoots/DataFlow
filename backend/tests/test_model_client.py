@@ -104,6 +104,26 @@ class ModelClientTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "对象"):
             ModelClient._parse_json("[]")
 
+    def test_missing_outer_brace_is_completed_without_changing_sql_or_values(self):
+        payload = {"action": "call_tool", "arguments": {"sql": "SELECT 'a{b}\\\"c' AS label", "contract": {"days": 7}, "reason": "查询"}}
+        raw = json.dumps(payload, ensure_ascii=False)[:-1]
+        client = ModelClient(self.config())
+        with patch.object(client, "chat", return_value=raw) as chat:
+            self.assertEqual(client.chat_json("system", "query"), payload)
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(client.json_retry_count, 0)
+
+    def test_format_completion_does_not_guess_content_or_fix_mismatched_braces(self):
+        for raw in ['{"n":12', '{"sql":"SELECT broken}', '{"a":[{} }', '{"a":{"n":1},', '{"a":{"n":1} trailing']:
+            with self.subTest(raw=raw), self.assertRaises(RuntimeError):
+                ModelClient._parse_json(raw)
+
+    def test_token_limit_truncation_is_rejected_even_if_outer_brace_can_be_completed(self):
+        client = ModelClient(self.config())
+        with patch.object(client, "_post", return_value={"choices": [{"message": {"content": '{"a":{"n":1}'}, "finish_reason": "length"}]}):
+            with self.assertRaisesRegex(RuntimeError, "截断"):
+                client.chat_json("system", "query")
+
     def test_empty_or_truncated_chat_output_is_rejected(self):
         client = ModelClient(self.config())
         for content, finish in [(None, "stop"), ("", "stop"), ('{"ok":', "length")]:

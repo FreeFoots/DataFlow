@@ -13,6 +13,8 @@ from .tools import (
     current_datetime,
     resolve_date_range,
 )
+from .tools.metric_tools import build_metric_query_tool, metric_description
+from ..querying.analysis_metrics import allowed_metrics
 
 
 READ_ONLY = ToolAnnotations(
@@ -88,4 +90,7 @@ def create_local_mcp_server(
             ),
             annotations=READ_ONLY,
         )(handler)
+    if allowed_metrics(scope):
+        server.tool(name="query_metric", title="查询业务指标", description=metric_description(scope),
+                    annotations=READ_ONLY)(build_metric_query_tool(database_engine, scope))
     return server

@@ -144,6 +144,7 @@ class SessionContext:
         return {
             "turn_id": str(item.get("task_id") or ""),
             "user_message": item.get("query", ""),
+            "standard_request": item.get("standard_request", ""),
             "route": item.get("route", ""),
             "status": item.get("status", ""),
             "result_title": item.get("result_title"),
@@ -193,6 +194,9 @@ class SessionContext:
             output.append({
                 "task_id": task_id,
                 "query": task["query"],
+                "standard_request": result.request_understanding.standard_request
+                    if result.request_understanding and result.request_understanding.status == "ready"
+                    else result.standalone_query or "",
                 "route": result.route,
                 "status": result.status,
                 "result_title": result.result_title,
@@ -214,7 +218,28 @@ class SessionContext:
             "columns": result.columns,
             "rows": result.rows[: self.table_row_limit],
             "sql": result.sql,
+            "standard_request": result.request_understanding.standard_request
+                if result.request_understanding and result.request_understanding.status == "ready"
+                else result.standalone_query or "",
         }, ensure_ascii=False)
+
+    def result_artifacts(self, session_id: str, workspace: dict[str, Any]) -> list[dict]:
+        """Only server-owned results can enter the checked-fact path."""
+        ids = list(dict.fromkeys(workspace.get("analysis_table_ids") or []))[:5]
+        if not ids:
+            latest = self.latest_table_result(session_id)
+            ids = [latest.task_id] if latest else []
+        assets = {}
+        for task_id in ids:
+            task = self.tasks.get(task_id)
+            if not task or task.get("session_id") != session_id:
+                continue
+            result = task["result"]
+            if result.status not in {"completed", "partial"}:
+                continue
+            for asset in result.result_artifacts:
+                assets[asset["result_id"]] = asset
+        return list(assets.values())
 
     def analysis_context(
         self, session_id: str, workspace: dict[str, Any]

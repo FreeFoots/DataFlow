@@ -58,6 +58,8 @@ class DuckDbEngine:
                 cursor = connection.execute(safe_sql)
                 raw_rows = cursor.fetchmany(201)
                 columns = [item[0] for item in cursor.description or []]
+                if len({column.casefold() for column in columns}) != len(columns):
+                    raise ValueError("结果列名重复，请使用唯一别名")
                 rows = [
                     {column: self._json_value(value) for column, value in zip(columns, row)}
                     for row in raw_rows[:200]
@@ -69,6 +71,7 @@ class DuckDbEngine:
                 rows,
                 execution_ms=round((time.perf_counter() - started_at) * 1000, 3),
                 truncated=len(raw_rows) > 200,
+                limited=any(isinstance(node, (exp.Limit, exp.Offset)) for node in sqlglot.parse_one(safe_sql, read="duckdb").walk()),
             )
         except (ValueError, ParseError, OptimizeError, duckdb.Error, OSError) as exc:
             return SqlExecution(

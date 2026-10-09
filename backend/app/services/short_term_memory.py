@@ -219,6 +219,7 @@ class ShortTermMemory:
         return {
             "turn_id": str(item.get("task_id") or ""),
             "user_message": item.get("query", ""),
+            "standard_request": item.get("standard_request", ""),
             "route": item.get("route", ""),
             "status": item.get("status", ""),
             "result_title": item.get("result_title"),

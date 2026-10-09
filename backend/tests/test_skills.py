@@ -7,10 +7,10 @@ class SkillRegistryTest(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = SkillRegistry()
 
-    def test_only_two_skills_are_enabled(self) -> None:
+    def test_query_qa_and_analysis_skills_are_enabled(self) -> None:
         self.assertEqual(
             [item["name"] for item in self.registry.list()],
-            ["data_qa", "database_query"],
+            ["analysis", "data_qa", "database_query"],
         )
 
     def test_qa_skill_only_exposes_presentation_tools(self) -> None:

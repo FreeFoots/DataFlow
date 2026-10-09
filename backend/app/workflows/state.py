@@ -19,6 +19,8 @@ class QueryState(TypedDict, total=False):
     intent: dict[str, Any]
     direct_response: str
     response_type: str
+    request_understanding: dict[str, Any]
+    understanding_answers: list[dict[str, str]]
     standalone_query: str
     rewritten: bool
     extraction: dict[str, Any]
@@ -36,3 +38,8 @@ class QueryState(TypedDict, total=False):
     tool_calls: list[dict[str, Any]]
     workflow_mode: str
     result: dict[str, Any]
+    request_mode: str
+    analysis_state: dict[str, Any]
+    analysis_route: str
+    result_artifacts: list[dict[str, Any]]
+    qa_artifacts: list[dict[str, Any]]

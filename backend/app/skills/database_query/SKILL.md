@@ -15,6 +15,10 @@
 
 ## 查询规划
 
+当前工具列表包含 `query_metric` 时，查询完整落在其指标定义、日期范围、channel/day/month维度、渠道编号筛选和排序能力内，优先使用该受控工具，由程序生成SQL。新增注册使用new_users，明确注册队列观察窗口的激活使用activation_cohort；不能把按激活发生日期的统计改成队列指标。调用格式为 `{"action":"call_tool","tool_name":"query_metric","arguments":{"query":{"metric_id":"new_users","start_date":"2026-04-01","end_date":"2026-05-01","dimensions":["channel"],"order_by":"new_users","descending":true}}}`。
+
+必须保留用户确认的所有条件。受控工具不支持地区、渠道类型、平台等额外筛选或其他指标时，沿用下方Schema SQL路径；不能为调用受控工具忽略条件。缺日期、激活观察窗口或评价标准时先澄清，不擅自默认。排名可指定order_by和descending，只有明确要求前N时填写top_n；不能擅自缩小结果。
+
 生成 SQL 前，先在内部确定以下内容：
 
 - 查询粒度：单行汇总、时间趋势、分组汇总或实体明细/排行。

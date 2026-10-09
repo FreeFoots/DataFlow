@@ -116,12 +116,15 @@ export interface VisualizationSpec {
   source_task_id: string
   category_field: string
   value_field: string
+  category_labels?: Record<string, string>
+  value_label?: string
   max_items: number
 }
 
 export interface AnalysisReport {
   title: string
   markdown: string
+  summary?: string
   visualizations: VisualizationSpec[]
 }
 
@@ -134,7 +137,7 @@ export interface ReportToolCall {
 
 export interface QueryResult {
   task_id: string
-  status: "waiting_clarification" | "completed" | "failed"
+  status: "waiting_clarification" | "completed" | "partial" | "failed"
   route: "database_query" | "data_qa" | "direct_response"
   message: string
   interpretation: null | {
@@ -149,6 +152,7 @@ export interface QueryResult {
     question: string
     reason: string
     options: ClarificationOption[]
+    allow_free_text?: boolean
   }
   steps: string[]
   sql: string | null
@@ -160,6 +164,12 @@ export interface QueryResult {
   saved: boolean
   result_title?: string | null
   standalone_query?: string | null
+  request_understanding?: {
+    summary: string
+    standard_request: string
+    status: "ready" | "needs_clarification"
+    clarifications: { question: string; answer: string; direction?: string; option_id?: string }[]
+  } | null
   schema_graph?: SchemaGraph | null
   retrieval?: null | {
     threshold: number
@@ -178,6 +188,45 @@ export interface QueryResult {
   workflow_mode?: "qa" | "single_database_fast_path" | "multi_database_handoff" | "langgraph_hitl" | string | null
   report?: AnalysisReport | null
   report_tool_calls?: ReportToolCall[]
+  analysis_plan?: AnalysisStep[]
+  result_artifacts?: ResultArtifact[]
+  analysis_claims?: { text: string; evidence_ids: string[] }[]
+  analysis_hypotheses?: { statement: string; status: "unverified"; evidence_ids: string[] }[]
+  analysis_limitations?: string[]
+  stop_reason?: string | null
+  analysis_budget?: Record<string, number>
+}
+
+export type QueryMode = "auto" | "query" | "analysis"
+export interface AnalysisStep { id: string; title: string; status: "pending" | "completed"; depends_on: string[]; evidence_ids: string[] }
+export interface ResultArtifact {
+  result_id: string
+  title: string
+  columns: string[]
+  rows: Record<string, string | number | null>[]
+  time_range: string
+  truncated: boolean
+  limited: boolean
+  semantic_verified: boolean
+  notes?: string[]
+  sql?: string
+  derived_from: string[]
+}
+
+export interface DurableTask {
+  task_id: string
+  session_id: string
+  query: string
+  workspace: WorkspaceConfig
+  state: "queued" | "running" | "waiting_clarification" | "completed" | "partial" | "failed" | "cancel_requested" | "cancelled" | "timed_out"
+  stage: string
+  version: number
+  created_at: number
+  updated_at: number
+  elapsed_seconds: number
+  recovery_count: number
+  result: QueryResult | null
+  analysis_progress?: { plan: AnalysisStep[]; result_count: number } | null
 }
 
 export interface ReportDataSource {

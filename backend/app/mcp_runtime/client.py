@@ -36,7 +36,8 @@ class LocalMcpClient:
             ]
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return asyncio.run(self._call_tool(name, arguments))
+        from ..runtime.execution import durable_call
+        return durable_call("tool", {"name": name, "arguments": arguments}, lambda: asyncio.run(self._call_tool(name, arguments)))
 
     async def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         async with Client(self.server) as client:

@@ -69,6 +69,10 @@ class Settings:
     max_schema_fields: int = int(os.getenv("MAX_SCHEMA_FIELDS", "20"))
     max_saved_memories: int = int(os.getenv("MAX_SAVED_MEMORIES", "20"))
     mcp_max_tool_calls: int = int(os.getenv("MCP_MAX_TOOL_CALLS", "3"))
+    analysis_max_tool_calls: int = int(os.getenv("ANALYSIS_MAX_TOOL_CALLS", "16"))
+    analysis_max_decisions: int = int(os.getenv("ANALYSIS_MAX_DECISIONS", "24"))
+    analysis_max_no_progress: int = int(os.getenv("ANALYSIS_MAX_NO_PROGRESS", "3"))
+    analysis_allow_exploratory_sql: bool = os.getenv("ANALYSIS_ALLOW_EXPLORATORY_SQL", "false").lower() in {"1", "true", "yes", "on"}
     short_term_summary_trigger_tokens: int = int(
         os.getenv("SHORT_TERM_SUMMARY_TRIGGER_TOKENS", "12000")
     )
@@ -89,6 +93,17 @@ class Settings:
     )
     context_table_row_limit: int = int(os.getenv("CONTEXT_TABLE_ROW_LIMIT", "50"))
     route_context_turns: int = int(os.getenv("ROUTE_CONTEXT_TURNS", "6"))
+    task_store_path: str = os.getenv("TASK_STORE_PATH", str(BASE_DIR / "data" / "runtime.db"))
+    database_root: str = str(BASE_DIR / "data" / "databases")
+    task_timeout_seconds: float = float(os.getenv("TASK_TIMEOUT_SECONDS", "300"))
+    task_lease_seconds: float = float(os.getenv("TASK_LEASE_SECONDS", "15"))
+    task_model_attempt_limit: int = int(os.getenv("TASK_MODEL_ATTEMPT_LIMIT", "40"))
+    task_queue_limit: int = int(os.getenv("TASK_QUEUE_LIMIT", "32"))
+
+    @property
+    def task_store_file(self) -> Path:
+        path = Path(self.task_store_path)
+        return path if path.is_absolute() else BASE_DIR / path
 
     @property
     def session_archive_file(self) -> Path:
@@ -148,6 +163,8 @@ class Settings:
             "max_schema_fields": self.max_schema_fields,
             "max_saved_memories": self.max_saved_memories,
             "mcp_max_tool_calls": self.mcp_max_tool_calls,
+            "analysis": {"max_tool_calls": self.analysis_max_tool_calls, "max_decisions": self.analysis_max_decisions,
+                         "max_no_progress": self.analysis_max_no_progress, "exploratory_sql": self.analysis_allow_exploratory_sql},
             "short_term_memory": {
                 "summary_enabled": self.short_term_summary_enabled,
                 "summary_trigger_tokens": self.short_term_summary_trigger_tokens,

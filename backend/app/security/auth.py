@@ -21,7 +21,7 @@ class AuthUser:
 
 
 class AuthService:
-    """进程内账号认证；令牌在服务重启后失效。"""
+    """演示账号认证；可持久保存令牌哈希，支持服务重启后重新连接。"""
 
     ACCOUNTS = {
         "admin": {
@@ -42,8 +42,9 @@ class AuthService:
         },
     }
 
-    def __init__(self) -> None:
+    def __init__(self, token_store=None) -> None:
         self._tokens: dict[str, AuthUser] = {}
+        self.token_store = token_store
 
     def login(self, username: str, password: str) -> tuple[str, AuthUser] | None:
         account = self.ACCOUNTS.get(username.strip())
@@ -51,7 +52,10 @@ class AuthService:
             return None
         token = secrets.token_urlsafe(32)
         user = account["user"]
-        self._tokens[token] = user
+        if self.token_store:
+            self.token_store.save_token(token, user.username, 86400)
+        else:
+            self._tokens[token] = user
         return token, user
 
     def authenticate(self, authorization: str | None) -> AuthUser | None:
@@ -60,10 +64,16 @@ class AuthService:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not token:
             return None
+        if self.token_store:
+            username = self.token_store.token_user(token)
+            account = self.ACCOUNTS.get(username or "")
+            return account["user"] if account else None
         return self._tokens.get(token)
 
     def logout(self, authorization: str | None) -> None:
         if not authorization:
             return
         _, _, token = authorization.partition(" ")
+        if self.token_store:
+            self.token_store.revoke_token(token)
         self._tokens.pop(token, None)

@@ -11,7 +11,7 @@ const colors = ["#277456", "#62a07f", "#98bca8", "#d2aa60", "#6983a8", "#a77b8c"
 const source = computed(() => props.sources.find((item) => item.taskId === props.spec.source_task_id))
 const points = computed(() => (source.value?.rows ?? [])
   .map((row) => ({
-    label: String(row[props.spec.category_field] ?? ""),
+    label: props.spec.category_labels?.[String(row[props.spec.category_field])] ?? String(row[props.spec.category_field] ?? ""),
     value: Number(row[props.spec.value_field]),
   }))
   .filter((item) => item.label && Number.isFinite(item.value))
@@ -38,7 +38,7 @@ function formatNumber(value: number) {
 
 <template>
   <section class="analysis-chart">
-    <header><div><small>{{ spec.type === "bar" ? "柱状图" : "饼图" }}</small><strong>{{ spec.title }}</strong></div><span>{{ spec.category_field }} × {{ spec.value_field }}</span></header>
+    <header><div><small>{{ spec.type === "bar" ? "柱状图" : "饼图" }}</small><strong>{{ spec.title }}</strong></div><span v-if="spec.value_label">{{ spec.value_label }}</span></header>
     <div v-if="!source || !points.length" class="chart-empty">找不到该图表引用的数据或数值字段。</div>
     <div v-else-if="spec.type === 'bar'" class="bar-chart">
       <div v-for="point in points" :key="point.label" class="bar-row">

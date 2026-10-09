@@ -26,6 +26,7 @@ class DatabaseQueryResult(BaseModel):
     rows: list[dict[str, Any]] = Field(default_factory=list, description="查询结果，最多200行")
     row_count: int = Field(default=0, description="返回结果行数")
     truncated: bool = Field(default=False, description="结果超过200行，当前仅返回预览")
+    limited: bool = Field(default=False, description="SQL包含LIMIT/OFFSET，结果限定范围")
     execution_ms: float = Field(default=0.0, description="SQL校验与执行耗时，单位毫秒")
     error: str | None = Field(default=None, description="执行失败时的错误信息")
 

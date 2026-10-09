@@ -277,6 +277,7 @@ class DataFlowService:
             "recent_result_context": self.context.recent_result_context(session_id),
             "analysis_context": analysis_context,
             "analysis_sources": analysis_sources,
+            "qa_artifacts": self.context.result_artifacts(session_id, workspace),
             "tool_facts": {},
             "execution_log": [],
             "tool_calls": [],

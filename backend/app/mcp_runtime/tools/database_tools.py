@@ -40,6 +40,7 @@ def build_database_query_tool(
             rows=execution.rows,
             row_count=len(execution.rows),
             truncated=execution.truncated,
+            limited=execution.limited,
             execution_ms=execution.execution_ms,
             error=execution.error,
         )

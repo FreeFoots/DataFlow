@@ -1,0 +1,7 @@
+{
+  "name": "analysis",
+  "description": "分步规划、发现数据、补查、比较和引用证据的复杂分析。",
+  "allowed_tools": ["list_metrics", "query_metric", "search_schema", "inspect_table", "query_data", "compare_results", "summarize_result", "read_result", "build_chart", "current_datetime"],
+  "max_tool_calls": 16,
+  "output_actions": ["plan", "call_tool", "clarify", "finish"]
+}
